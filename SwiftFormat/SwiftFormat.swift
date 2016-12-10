@@ -2,8 +2,6 @@
 //  SwiftFormat.swift
 //  SwiftFormat
 //
-//  Version 0.18
-//
 //  Created by Nick Lockwood on 12/08/2016.
 //  Copyright 2016 Nick Lockwood
 //
@@ -34,52 +32,92 @@
 import Foundation
 
 /// The current SwiftFormat version
-public let version = "0.18"
+public let version = "0.20"
+
+/// Errors
+public enum FormatError: Error, CustomStringConvertible {
+    case reading(String)
+    case writing(String)
+    case parsing(String)
+    case options(String)
+
+    public var description: String {
+        switch self {
+        case .reading(let string),
+             .writing(let string),
+             .parsing(let string),
+             .options(let string):
+            return string
+        }
+    }
+}
+
+/// File enumeration options
+public struct FileOptions {
+    public var followSymlinks: Bool = false
+    public var supportedFileExtensions = ["swift"]
+}
 
 /// Enumerate all swift files at the specified location and (optionally) calculate an output file URL for each
-public func enumerateSwiftFiles(withInputURL inputURL: URL, outputURL: URL? = nil, block: (URL, URL) -> Void) {
+public func enumerateSwiftFiles(withInputURL inputURL: URL,
+                                outputURL: URL? = nil,
+                                options: FileOptions = FileOptions(),
+                                block: (URL, URL) throws -> Void) throws {
+
     let manager = FileManager.default
-    var isDirectory: ObjCBool = false
-    if manager.fileExists(atPath: inputURL.path, isDirectory: &isDirectory) {
-        if isDirectory.boolValue {
+    let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .isAliasFileKey, .isSymbolicLinkKey]
+    do {
+        let resourceValues = try inputURL.resourceValues(forKeys: Set(keys))
+        if resourceValues.isRegularFile == true {
+            if options.supportedFileExtensions.contains(inputURL.pathExtension) {
+                try block(inputURL, outputURL ?? inputURL)
+            }
+        } else if resourceValues.isDirectory == true {
             guard let files = try? manager.contentsOfDirectory(
-                at: inputURL, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) else {
-                print("error: failed to read contents of directory at: \(inputURL.path)")
-                return
+                at: inputURL, includingPropertiesForKeys: keys, options: .skipsHiddenFiles) else {
+                throw FormatError.reading("failed to read contents of directory at: \(inputURL.path)")
             }
-            if let outputURL = outputURL {
-                do {
-                    try manager.createDirectory(at: outputURL, withIntermediateDirectories: true, attributes: nil)
-                    for url in files {
-                        let outputPath = outputURL.path + url.path.substring(from: inputURL.path.characters.endIndex)
-                        enumerateSwiftFiles(withInputURL: url, outputURL: URL(fileURLWithPath: outputPath), block: block)
-                    }
-                } catch {
-                    print("error: failed to create directory at: \(outputURL.path), \(error)")
-                    return
+            for url in files {
+                let outputURL = outputURL.map {
+                    URL(fileURLWithPath: $0.path + url.path.substring(from: inputURL.path.characters.endIndex))
                 }
-            } else {
-                for url in files {
-                    enumerateSwiftFiles(withInputURL: url, block: block)
-                }
+                try enumerateSwiftFiles(withInputURL: url, outputURL: outputURL, options: options, block: block)
             }
-        } else if inputURL.pathExtension == "swift" {
-            block(inputURL, outputURL ?? inputURL)
+        } else if options.followSymlinks &&
+            (resourceValues.isSymbolicLink == true || resourceValues.isAliasFile == true) {
+            let resolvedURL = inputURL.resolvingSymlinksInPath()
+            try enumerateSwiftFiles(
+                withInputURL: resolvedURL, outputURL: outputURL, options: options, block: block)
         }
-    } else {
-        print("error: file not found: \(inputURL.path)")
+    } catch {
+        if manager.fileExists(atPath: inputURL.path) {
+            throw FormatError.reading("failed to read attributes for: \(inputURL.path)")
+        } else {
+            throw FormatError.reading("file not found: \(inputURL.path)")
+        }
     }
+}
+
+/// Process token error
+public func parsingError(for tokens: [Token]) -> FormatError? {
+    if let last = tokens.last, case .error(let string) = last {
+        // TODO: more useful errors
+        if string.isEmpty {
+            return .parsing("unexpected end of file")
+        } else {
+            return .parsing("unexpected token '\(string)'")
+        }
+    }
+    return nil
 }
 
 /// Format a pre-parsed token array
 public func format(_ tokens: [Token],
-                   rules: [FormatRule] = defaultRules,
+                   rules: [FormatRule] = FormatRules.default,
                    options: FormatOptions = FormatOptions()) throws -> String {
-
     // Parse
-    guard options.fragment || tokens.last?.isError == false else {
-        // TODO: more useful errors
-        throw NSError(domain: "SwiftFormat", code: 0, userInfo: nil)
+    if !options.fragment, let error = parsingError(for: tokens) {
+        throw error
     }
 
     // Format
@@ -94,7 +132,7 @@ public func format(_ tokens: [Token],
 
 /// Format code with specified rules and options
 public func format(_ source: String,
-                   rules: [FormatRule] = defaultRules,
+                   rules: [FormatRule] = FormatRules.default,
                    options: FormatOptions = FormatOptions()) throws -> String {
 
     return try format(tokenize(source), rules: rules, options: options)
@@ -102,29 +140,30 @@ public func format(_ source: String,
 
 // MARK: Internal APIs used by CLI - included here for testing purposes
 
-func inferOptions(from inputURL: URL) -> (Int, FormatOptions) {
+func inferOptions(from inputURL: URL) throws -> (Int, FormatOptions) {
     var tokens = [Token]()
     var filesChecked = 0
-    enumerateSwiftFiles(withInputURL: inputURL) { inputURL, _ in
-        if let input = try? String(contentsOf: inputURL) {
-            let _tokens = tokenize(input)
-            if _tokens.last?.isError == false {
-                filesChecked += 1
-                tokens += _tokens
-            } else {
-                print("error: could not parse file: \(inputURL.path)")
-            }
-        } else {
-            print("error: failed to read file: \(inputURL.path)")
+    try enumerateSwiftFiles(withInputURL: inputURL) { inputURL, _ in
+        let input = try String(contentsOf: inputURL)
+        let _tokens = tokenize(input)
+        if let error = parsingError(for: _tokens) {
+            throw error
         }
+        filesChecked += 1
+        tokens += _tokens
     }
-    return (filesChecked, inferOptions(tokens))
+    return (filesChecked, inferOptions(from: tokens))
 }
 
-func processInput(_ inputURLs: [URL], andWriteToOutput outputURL: URL? = nil,
-                  withOptions options: FormatOptions, cacheURL: URL? = nil) -> (Int, Int) {
+func processInput(_ inputURLs: [URL],
+                  andWriteToOutput outputURL: URL? = nil,
+                  withRules rules: [FormatRule],
+                  formatOptions: FormatOptions,
+                  fileOptions: FileOptions,
+                  cacheURL: URL? = nil) throws -> (Int, Int) {
+
     // Load cache
-    let cachePrefix = version + String(describing: options)
+    let cachePrefix = "\(version);\(formatOptions)"
     let cacheDirectory = cacheURL?.deletingLastPathComponent().absoluteURL
     var cache: [String: String]?
     if let cacheURL = cacheURL {
@@ -133,7 +172,19 @@ func processInput(_ inputURLs: [URL], andWriteToOutput outputURL: URL? = nil,
     // Format files
     var filesChecked = 0, filesWritten = 0
     for inputURL in inputURLs {
-        enumerateSwiftFiles(withInputURL: inputURL, outputURL: outputURL) { inputURL, outputURL in
+        guard let resourceValues = try? inputURL.resourceValues(
+            forKeys: Set([.isDirectoryKey, .isAliasFileKey, .isSymbolicLinkKey])) else {
+            throw FormatError.reading("failed to read attributes for: \(inputURL.path)")
+        }
+        if !fileOptions.followSymlinks &&
+            (resourceValues.isAliasFile == true || resourceValues.isSymbolicLink == true) {
+            throw FormatError.options("cannot format symbolic link or alias file: \(inputURL.path)")
+        } else if resourceValues.isDirectory == false &&
+            !fileOptions.supportedFileExtensions.contains(inputURL.pathExtension) {
+            throw FormatError.options("cannot format non-Swift file: \(inputURL.path)")
+        }
+        try enumerateSwiftFiles(withInputURL: inputURL, outputURL: outputURL, options: fileOptions) {
+            inputURL, outputURL in
             filesChecked += 1
             let cacheKey: String = {
                 var path = inputURL.absoluteURL.path
@@ -144,42 +195,58 @@ func processInput(_ inputURLs: [URL], andWriteToOutput outputURL: URL? = nil,
                 return path
             }()
             if let input = try? String(contentsOf: inputURL) {
+                let output: String
                 if cache?[cacheKey] == cachePrefix + String(input.characters.count) {
+                    output = input
+                } else {
+                    output = try format(input, rules: rules, options: formatOptions)
+                    cache?[cacheKey] = cachePrefix + String(output.characters.count)
+                }
+                if outputURL != inputURL {
+                    if (try? String(contentsOf: outputURL)) == output {
+                        // Destination file is already the same as output
+                        return
+                    }
+                    do {
+                        try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(),
+                                                                withIntermediateDirectories: true,
+                                                                attributes: nil)
+                    } catch {
+                        throw FormatError.writing("failed to create directory at: \(outputURL.path), \(error)")
+                    }
+                } else if output == input {
                     // No changes needed
                     return
                 }
-                guard let output = try? format(input, options: options) else {
-                    print("error: could not parse file: \(inputURL.path)")
-                    return
+                do {
+                    try output.write(to: outputURL, atomically: true, encoding: String.Encoding.utf8)
+                    filesWritten += 1
+                } catch {
+                    throw FormatError.writing("failed to write file: \(outputURL.path), \(error)")
                 }
-                if output != input {
-                    if (try? output.write(to: outputURL, atomically: true, encoding: String.Encoding.utf8)) != nil {
-                        filesWritten += 1
-                    } else {
-                        print("error: failed to write file: \(outputURL.path)")
-                        return
-                    }
-                }
-                cache?[cacheKey] = cachePrefix + String(output.characters.count)
             } else {
-                print("error: failed to read file: \(inputURL.path)")
+                throw FormatError.reading("failed to read file: \(inputURL.path)")
             }
         }
+    }
+    if filesChecked == 0 {
+        let inputPaths = inputURLs.map({ $0.path }).joined(separator: ", ")
+        throw FormatError.options("no eligible files found at: \(inputPaths)")
     }
     // Save cache
     if let cache = cache, let cacheURL = cacheURL, let cacheDirectory = cacheDirectory {
         if !(cache as NSDictionary).write(to: cacheURL, atomically: true) {
             if FileManager.default.fileExists(atPath: cacheDirectory.path) {
-                print("error: failed to write cache file at: \(cacheURL.path)")
+                throw FormatError.writing("failed to write cache file at: \(cacheURL.path)")
             } else {
-                print("error: specified cache file directory does not exist: \(cacheDirectory.path)")
+                throw FormatError.reading("specified cache file directory does not exist: \(cacheDirectory.path)")
             }
         }
     }
     return (filesWritten, filesChecked)
 }
 
-func preprocessArguments(_ args: [String], _ names: [String]) -> [String: String]? {
+func preprocessArguments(_ args: [String], _ names: [String]) throws -> [String: String] {
     var anonymousArgs = 0
     var namedArgs: [String: String] = [:]
     var name = ""
@@ -188,8 +255,7 @@ func preprocessArguments(_ args: [String], _ names: [String]) -> [String: String
             // Long argument names
             let key = arg.substring(from: arg.characters.index(arg.startIndex, offsetBy: 2))
             if !names.contains(key) {
-                print("error: unknown argument: \(arg).")
-                return nil
+                throw FormatError.options("unknown argument: \(arg).")
             }
             name = key
             namedArgs[name] = ""
@@ -199,11 +265,9 @@ func preprocessArguments(_ args: [String], _ names: [String]) -> [String: String
             let flag = arg.substring(from: arg.characters.index(arg.startIndex, offsetBy: 1))
             let matches = names.filter { $0.hasPrefix(flag) }
             if matches.count > 1 {
-                print("error: ambiguous argument: \(arg).")
-                return nil
+                throw FormatError.options("ambiguous argument: \(arg).")
             } else if matches.count == 0 {
-                print("error: unknown argument: \(arg).")
-                return nil
+                throw FormatError.options("unknown argument: \(arg).")
             } else {
                 name = matches[0]
                 namedArgs[name] = ""
@@ -263,8 +327,12 @@ func commandLineArguments(for options: FormatOptions) -> [String: String] {
                 args["allman"] = options.allmanBraces ? "true" : "false"
             case "stripHeader":
                 args["header"] = options.stripHeader ? "strip" : "ignore"
-            case "ifdefIndentMode":
-                args["ifdef"] = options.ifdefIndentMode.rawValue
+            case "ifdefIndent":
+                args["ifdef"] = options.ifdefIndent.rawValue
+            case "wrapArguments":
+                args["wraparguments"] = options.wrapArguments.rawValue
+            case "wrapElements":
+                args["wrapelements"] = options.wrapElements.rawValue
             case "uppercaseHex":
                 args["hexliterals"] = options.uppercaseHex ? "uppercase" : "lowercase"
             case "experimentalRules":
@@ -279,7 +347,221 @@ func commandLineArguments(for options: FormatOptions) -> [String: String] {
     return args
 }
 
+private func processOption(_ key: String, in args: [String: String], handler: (String) throws -> Void) throws {
+    precondition(commandLineArguments.contains(key))
+    guard let value = args[key] else {
+        return
+    }
+    guard !value.isEmpty else {
+        throw FormatError.options("--\(key) option expects a value.")
+    }
+    do {
+        try handler(value.lowercased())
+    } catch {
+        throw FormatError.options("unsupported --\(key) value: \(value).")
+    }
+}
+
+func fileOptionsFor(_ args: [String: String]) throws -> FileOptions {
+    var options = FileOptions()
+    try processOption("symlinks", in: args) {
+        switch $0 {
+        case "follow":
+            options.followSymlinks = true
+        case "ignore":
+            options.followSymlinks = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    return options
+}
+
+func formatOptionsFor(_ args: [String: String]) throws -> FormatOptions {
+    var options = FormatOptions()
+    try processOption("indent", in: args) {
+        switch $0 {
+        case "tab", "tabs", "tabbed":
+            options.indent = "\t"
+        default:
+            if let spaces = Int($0) {
+                options.indent = String(repeating: " ", count: spaces)
+                break
+            }
+            throw FormatError.options("")
+        }
+    }
+    try processOption("allman", in: args) {
+        switch $0 {
+        case "true", "enabled":
+            options.allmanBraces = true
+        case "false", "disabled":
+            options.allmanBraces = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("semicolons", in: args) {
+        switch $0 {
+        case "inline":
+            options.allowInlineSemicolons = true
+        case "never", "false":
+            options.allowInlineSemicolons = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("commas", in: args) {
+        switch $0 {
+        case "always", "true":
+            options.trailingCommas = true
+        case "inline", "false":
+            options.trailingCommas = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("comments", in: args) {
+        switch $0 {
+        case "indent", "indented":
+            options.indentComments = true
+        case "ignore":
+            options.indentComments = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("linebreaks", in: args) {
+        switch $0 {
+        case "cr":
+            options.linebreak = "\r"
+        case "lf":
+            options.linebreak = "\n"
+        case "crlf":
+            options.linebreak = "\r\n"
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("ranges", in: args) {
+        switch $0 {
+        case "space", "spaced", "spaces":
+            options.spaceAroundRangeOperators = true
+        case "nospace":
+            options.spaceAroundRangeOperators = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("empty", in: args) {
+        switch $0 {
+        case "void":
+            options.useVoid = true
+        case "tuple", "tuples":
+            options.useVoid = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("trimwhitespace", in: args) {
+        switch $0 {
+        case "always":
+            options.truncateBlankLines = true
+        case "nonblank-lines", "nonblank", "non-blank-lines", "non-blank",
+             "nonempty-lines", "nonempty", "non-empty-lines", "non-empty":
+            options.truncateBlankLines = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("insertlines", in: args) {
+        switch $0 {
+        case "enabled", "true":
+            options.insertBlankLines = true
+        case "disabled", "false":
+            options.insertBlankLines = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("removelines", in: args) {
+        switch $0 {
+        case "enabled", "true":
+            options.removeBlankLines = true
+        case "disabled", "false":
+            options.removeBlankLines = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("header", in: args) {
+        switch $0 {
+        case "strip":
+            options.stripHeader = true
+        case "ignore":
+            options.stripHeader = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("ifdef", in: args) {
+        if let mode = IndentMode(rawValue: $0) {
+            options.ifdefIndent = mode
+        } else {
+            throw FormatError.options("")
+        }
+    }
+    try processOption("wraparguments", in: args) {
+        if let mode = WrapMode(rawValue: $0) {
+            options.wrapArguments = mode
+        } else {
+            throw FormatError.options("")
+        }
+    }
+    try processOption("wrapelements", in: args) {
+        if let mode = WrapMode(rawValue: $0) {
+            options.wrapElements = mode
+        } else {
+            throw FormatError.options("")
+        }
+    }
+    try processOption("hexliterals", in: args) {
+        switch $0 {
+        case "uppercase", "upper":
+            options.uppercaseHex = true
+        case "lowercase", "lower":
+            options.uppercaseHex = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("experimental", in: args) {
+        switch $0 {
+        case "enabled", "true":
+            options.experimentalRules = true
+        case "disabled", "false":
+            options.experimentalRules = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    try processOption("fragment", in: args) {
+        switch $0 {
+        case "true", "enabled":
+            options.fragment = true
+        case "false", "disabled":
+            options.fragment = false
+        default:
+            throw FormatError.options("")
+        }
+    }
+    return options
+}
+
 let commandLineArguments = [
+    // File options
+    "symlinks",
+    // Format options
     "output",
     "inferoptions",
     "indent",
@@ -295,10 +577,14 @@ let commandLineArguments = [
     "removelines",
     "header",
     "ifdef",
+    "wraparguments",
+    "wrapelements",
     "hexliterals",
     "experimental",
     "fragment",
     "cache",
+    "disable",
+    "rules",
     "help",
     "version",
 ]

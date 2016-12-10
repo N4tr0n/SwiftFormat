@@ -2,8 +2,6 @@
 //  Rules.swift
 //  SwiftFormat
 //
-//  Version 0.18
-//
 //  Created by Nick Lockwood on 21/10/2016.
 //  Copyright 2016 Nick Lockwood
 //
@@ -36,8 +34,15 @@ import Foundation
 /// The indenting mode to use for #if/#endif statements
 public enum IndentMode: String {
     case indent
-    case noindent
+    case noIndent = "noindent"
     case outdent
+}
+
+/// Wrap mode for arguments
+public enum WrapMode: String {
+    case beforeFirst = "beforefirst"
+    case afterFirst = "afterfirst"
+    case disabled
 }
 
 /// Configuration options for formatting. These aren't actually used by the
@@ -55,7 +60,9 @@ public struct FormatOptions: CustomStringConvertible {
     public var removeBlankLines: Bool
     public var allmanBraces: Bool
     public var stripHeader: Bool
-    public var ifdefIndentMode: IndentMode
+    public var ifdefIndent: IndentMode
+    public var wrapArguments: WrapMode
+    public var wrapElements: WrapMode
     public var uppercaseHex: Bool
     public var experimentalRules: Bool
     public var fragment: Bool
@@ -72,7 +79,9 @@ public struct FormatOptions: CustomStringConvertible {
                 removeBlankLines: Bool = true,
                 allmanBraces: Bool = false,
                 stripHeader: Bool = false,
-                ifdefIndentMode: IndentMode = .indent,
+                ifdefIndent: IndentMode = .indent,
+                wrapArguments: WrapMode = .disabled,
+                wrapElements: WrapMode = .beforeFirst,
                 uppercaseHex: Bool = true,
                 experimentalRules: Bool = false,
                 fragment: Bool = false) {
@@ -89,7 +98,9 @@ public struct FormatOptions: CustomStringConvertible {
         self.removeBlankLines = removeBlankLines
         self.allmanBraces = allmanBraces
         self.stripHeader = stripHeader
-        self.ifdefIndentMode = ifdefIndentMode
+        self.ifdefIndent = ifdefIndent
+        self.wrapArguments = wrapArguments
+        self.wrapElements = wrapElements
         self.uppercaseHex = uppercaseHex
         self.experimentalRules = experimentalRules
         self.fragment = fragment
@@ -104,7 +115,7 @@ public struct FormatOptions: CustomStringConvertible {
 }
 
 /// Infer default options by examining the existing source
-public func inferOptions(_ tokens: [Token]) -> FormatOptions {
+public func inferOptions(from tokens: [Token]) -> FormatOptions {
     let formatter = Formatter(tokens)
     var options = FormatOptions()
 
@@ -119,9 +130,9 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
             }
             indents.append((indent, 0))
         }
-        formatter.forEachToken({ $0.isLinebreak }) { i, token in
-            let start = formatter.startOfLine(atIndex: i)
-            if case .whitespace(let string) = formatter.tokens[start] {
+        formatter.forEach(.linebreak) { i, token in
+            let start = formatter.startOfLine(at: i)
+            if case .space(let string) = formatter.tokens[start] {
                 if string.hasPrefix("\t") {
                     increment("\t")
                 } else {
@@ -172,9 +183,9 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
         var spaced = 0, unspaced = 0
         formatter.forEachToken { i, token in
             if token == .symbol("...") || token == .symbol("..<") {
-                if let nextToken = formatter.nextNonWhitespaceOrCommentOrLinebreakToken(fromIndex: i) {
+                if let nextToken = formatter.next(.nonSpaceOrCommentOrLinebreak, after: i) {
                     if nextToken.string != ")" && nextToken.string != "," {
-                        if formatter.tokenAtIndex(i + 1)?.isWhitespaceOrLinebreak == true {
+                        if formatter.token(at: i + 1)?.isSpaceOrLinebreak == true {
                             spaced += 1
                         } else {
                             unspaced += 1
@@ -188,19 +199,19 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
 
     options.useVoid = {
         var voids = 0, tuples = 0
-        formatter.forEachToken(.identifier("Void")) { i, token in
-            if let prevToken = formatter.previousNonWhitespaceOrCommentOrLinebreakToken(fromIndex: i),
+        formatter.forEach(.identifier("Void")) { i, token in
+            if let prevToken = formatter.last(.nonSpaceOrCommentOrLinebreak, before: i),
                 prevToken == .symbol(".") || prevToken == .keyword("typealias") {
                 return
             }
             voids += 1
         }
-        formatter.forEachToken(.startOfScope("(")) { i, token in
-            if let prevIndex = formatter.indexOfPreviousToken(fromIndex: i, matching: { !$0.isWhitespaceOrCommentOrLinebreak }),
-                let prevToken = formatter.tokenAtIndex(prevIndex), prevToken.string == "->",
-                let nextIndex = formatter.indexOfNextToken(fromIndex: i, matching: { !$0.isWhitespaceOrLinebreak }),
-                let nextToken = formatter.tokenAtIndex(nextIndex), nextToken.string == ")",
-                formatter.nextNonWhitespaceOrCommentOrLinebreakToken(fromIndex: nextIndex)?.string != "->" {
+        formatter.forEach(.startOfScope("(")) { i, token in
+            if let prevIndex = formatter.index(of: .nonSpaceOrCommentOrLinebreak, before: i),
+                let prevToken = formatter.token(at: prevIndex), prevToken.string == "->",
+                let nextIndex = formatter.index(of: .nonSpaceOrLinebreak, after: i),
+                let nextToken = formatter.token(at: nextIndex), nextToken.string == ")",
+                formatter.next(.nonSpaceOrCommentOrLinebreak, after: nextIndex)?.string != "->" {
                 tuples += 1
             }
         }
@@ -209,12 +220,10 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
 
     options.trailingCommas = {
         var trailing = 0, noTrailing = 0
-        formatter.forEachToken(.endOfScope("]")) { i, token in
-            if let linebreakIndex = formatter.indexOfPreviousToken(fromIndex: i, matching: {
-                return !$0.isWhitespaceOrComment }), case .linebreak = formatter.tokens[linebreakIndex] {
-                if let previousTokenIndex = formatter.indexOfPreviousToken(fromIndex: linebreakIndex + 1, matching: {
-                    return !$0.isWhitespaceOrCommentOrLinebreak
-                }), let token = formatter.tokenAtIndex(previousTokenIndex) {
+        formatter.forEach(.endOfScope("]")) { i, token in
+            if let linebreakIndex = formatter.index(of: .nonSpaceOrComment, before: i),
+                case .linebreak = formatter.tokens[linebreakIndex] {
+                if let prevTokenIndex = formatter.index(of: .nonSpaceOrCommentOrLinebreak, before: linebreakIndex + 1), let token = formatter.token(at: prevTokenIndex) {
                     switch token.string {
                     case "[", ":":
                         break // do nothing
@@ -233,7 +242,7 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
         var shouldIndent = true
         var nestedComments = 0
         var prevIndent: Int?
-        var lastToken = Token.whitespace("")
+        var lastTokenWasLinebreak = false
         for token in formatter.tokens {
             switch token {
             case .startOfScope:
@@ -244,7 +253,7 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
             case .endOfScope:
                 if token.string == "*/" {
                     if nestedComments > 0 {
-                        if case .linebreak = lastToken {
+                        if lastTokenWasLinebreak {
                             if prevIndent != nil && prevIndent! >= 2 {
                                 shouldIndent = false
                                 break
@@ -257,8 +266,8 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
                     }
                 }
                 prevIndent = nil
-            case .whitespace:
-                if case .linebreak = lastToken, nestedComments > 0 {
+            case .space:
+                if lastTokenWasLinebreak, nestedComments > 0 {
                     let indent = token.string.characters.count
                     if prevIndent != nil && abs(prevIndent! - indent) >= 2 {
                         shouldIndent = false
@@ -267,7 +276,7 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
                     prevIndent = indent
                 }
             case .commentBody:
-                if case .linebreak = lastToken, nestedComments > 0 {
+                if lastTokenWasLinebreak, nestedComments > 0 {
                     if prevIndent != nil && prevIndent! >= 2 {
                         shouldIndent = false
                         break
@@ -277,7 +286,7 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
             default:
                 break
             }
-            lastToken = token
+            lastTokenWasLinebreak = token.isLinebreak
         }
         return shouldIndent
     }()
@@ -290,10 +299,10 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
             case .startOfScope:
                 scopeStack.append(token)
             case .linebreak:
-                if let nextToken = formatter.tokenAtIndex(i + 1) {
+                if let nextToken = formatter.token(at: i + 1) {
                     switch nextToken {
-                    case .whitespace:
-                        if let nextToken = formatter.tokenAtIndex(i + 2) {
+                    case .space:
+                        if let nextToken = formatter.token(at: i + 2) {
                             if case .linebreak = nextToken {
                                 untruncated += 1
                             }
@@ -307,7 +316,7 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
                     }
                 }
             default:
-                if let scope = scopeStack.last, token.closesScopeForToken(scope) {
+                if let scope = scopeStack.last, token.isEndOfScope(scope) {
                     scopeStack.removeLast()
                 }
             }
@@ -321,16 +330,15 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
 
     options.allmanBraces = {
         var allman = 0, knr = 0
-        formatter.forEachToken(.startOfScope("{")) { i, token in
+        formatter.forEach(.startOfScope("{")) { i, token in
             // Check this isn't an inline block
-            guard let nextLinebreakIndex = formatter.indexOfNextToken(fromIndex: i, matching: {
-                $0.isLinebreak
-            }), let closingBraceIndex = formatter.indexOfNextToken(fromIndex: i, matching: {
-                return $0 == .endOfScope("}") }), nextLinebreakIndex < closingBraceIndex else { return }
+            guard let nextLinebreakIndex = formatter.index(of: .linebreak, after: i),
+                let closingBraceIndex = formatter.index(of: .endOfScope("}"), after: i),
+                nextLinebreakIndex < closingBraceIndex else { return }
             // Check if brace is wrapped
-            if let previousTokenIndex = formatter.indexOfPreviousToken(fromIndex: i, matching: {
-                !$0.isWhitespace }), let previousToken = formatter.tokenAtIndex(previousTokenIndex) {
-                switch previousToken {
+            if let prevTokenIndex = formatter.index(of: .nonSpace, before: i),
+                let prevToken = formatter.token(at: prevTokenIndex) {
+                switch prevToken {
                 case .identifier, .endOfScope:
                     knr += 1
                 case .linebreak:
@@ -343,29 +351,28 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
         return allman > knr
     }()
 
-    options.ifdefIndentMode = {
-        var indented = 0, noindented = 0, outdented = 0
-        formatter.forEachToken(.startOfScope("#if")) { i, token in
-            if let indent = formatter.tokenAtIndex(i - 1), case .whitespace(let string) = indent,
+    options.ifdefIndent = {
+        var indented = 0, notIndented = 0, outdented = 0
+        formatter.forEach(.startOfScope("#if")) { i, token in
+            if let indent = formatter.token(at: i - 1), case .space(let string) = indent,
                 !string.isEmpty {
                 // Indented, check next line
-                if let nextLineIndex = formatter.indexOfNextToken(fromIndex: i, matching: { $0.isLinebreak }),
-                    let nextIndex = formatter.indexOfNextToken(fromIndex: nextLineIndex, matching: {
-                        !$0.isWhitespaceOrLinebreak }) {
+                if let nextLineIndex = formatter.index(of: .linebreak, after: i),
+                    let nextIndex = formatter.index(of: .nonSpaceOrLinebreak, after: nextLineIndex) {
                     switch formatter.tokens[nextIndex - 1] {
-                    case .whitespace(let innerString):
+                    case .space(let innerString):
                         if innerString.isEmpty {
                             // Error?
                             return
                         } else if innerString == string {
-                            noindented += 1
+                            notIndented += 1
                         } else {
                             // Assume more indented, as less would be a mistake
                             indented += 1
                         }
                     case .linebreak:
                         // Could be noindent or outdent
-                        noindented += 1
+                        notIndented += 1
                         outdented += 1
                     default:
                         break
@@ -375,11 +382,10 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
                 return
             }
             // Not indented, check next line
-            if let nextLineIndex = formatter.indexOfNextToken(fromIndex: i, matching: { $0.isLinebreak }),
-                let nextIndex = formatter.indexOfNextToken(fromIndex: nextLineIndex, matching: {
-                    !$0.isWhitespaceOrLinebreak }) {
+            if let nextLineIndex = formatter.index(of: .linebreak, after: i),
+                let nextIndex = formatter.index(of: .nonSpaceOrLinebreak, after: nextLineIndex) {
                 switch formatter.tokens[nextIndex - 1] {
-                case .whitespace(let string):
+                case .space(let string):
                     if string.isEmpty {
                         fallthrough
                     } else if string == formatter.options.indent {
@@ -392,7 +398,7 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
                     }
                 case .linebreak:
                     // Could be noindent or outdent
-                    noindented += 1
+                    notIndented += 1
                     outdented += 1
                 default:
                     break
@@ -400,12 +406,58 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
             }
             // Error?
         }
-        if noindented > indented {
-            return outdented > noindented ? .outdent : .noindent
+        if notIndented > indented {
+            return outdented > notIndented ? .outdent : .noIndent
         } else {
             return outdented > indented ? .outdent : .indent
         }
     }()
+
+    func wrapMode(for scopes: String..., allowGrouping: Bool) -> WrapMode {
+        var beforeFirst = 0, afterFirst = 0, neither = 0
+        formatter.forEachToken(where: { $0.isStartOfScope && scopes.contains($0.string) }) { i, token in
+            if let closingBraceIndex =
+                formatter.index(after: i, where: { $0.isEndOfScope(token) }),
+                let linebreakIndex = formatter.index(of: .linebreak, after: i),
+                linebreakIndex < closingBraceIndex,
+                let firstCommaIndex = formatter.index(of: .symbol(","), after: i),
+                firstCommaIndex < closingBraceIndex {
+                if !allowGrouping {
+                    // Check for two consecutive arguments on the same line
+                    var index = formatter.index(of: .nonSpaceOrCommentOrLinebreak, before: closingBraceIndex)!
+                    if formatter.tokens[index] != .symbol(",") {
+                        index += 1
+                    }
+                    while index > i {
+                        guard let commaIndex = formatter.index(of: .symbol(","), before: index) else {
+                            break
+                        }
+                        if formatter.next(.nonSpaceOrComment, after: commaIndex)?.isLinebreak == false {
+                            neither += 1
+                            return
+                        }
+                        index = commaIndex
+                    }
+                }
+                // Check if linebreak is after opening paren or first comma
+                if formatter.next(.nonSpaceOrComment, after: i)?.isLinebreak == true {
+                    beforeFirst += 1
+                } else {
+                    assert(formatter.next(.nonSpaceOrComment, after: firstCommaIndex)?.isLinebreak == true)
+                    afterFirst += 1
+                }
+            }
+        }
+        if beforeFirst > afterFirst + neither {
+            return .beforeFirst
+        } else if afterFirst > beforeFirst + neither {
+            return .afterFirst
+        } else {
+            return .disabled
+        }
+    }
+    options.wrapArguments = wrapMode(for: "(", "<", allowGrouping: false)
+    options.wrapElements = wrapMode(for: "[", allowGrouping: true)
 
     options.uppercaseHex = {
         let prefix = "0x"
@@ -422,7 +474,7 @@ public func inferOptions(_ tokens: [Token]) -> FormatOptions {
                 }
             }
         }
-        return uppercase > lowercase
+        return uppercase >= lowercase
     }()
 
     return options
